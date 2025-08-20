@@ -33,7 +33,7 @@ Configuração via variáveis de ambiente (com valores padrão):
 - MAX_RETRIES (default: 3)
 - BACKOFF_BASE_SEC (default: 1.5)
 - MAX_FILE_MB (default: 50)
-- INSTITUTION_NAME (default: HOSPITAL MUNICIPAL SAO JOSE)
+- INSTITUTION_NAME (default: HOSPITAL DIGITAL)
 - REFERRING_PHYSICIAN (default: AUTOMATIZADO)
 
 Exemplo de uso manual:
@@ -87,7 +87,7 @@ FIXED_EXAM = {
     "Modality": os.getenv("EXAM_MODALITY", "ECG")
 }
 
-INSTITUTION_NAME = os.getenv("INSTITUTION_NAME", "HOSPITAL MUNICIPAL SAO JOSE")
+INSTITUTION_NAME = os.getenv("INSTITUTION_NAME", "HOSPITAL DIGITAL")
 REFERRING_PHYSICIAN = os.getenv("REFERRING_PHYSICIAN", "AUTOMATIZADO")
 
 # -------------------------- LOGGING --------------------------
