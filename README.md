@@ -47,8 +47,8 @@ Todos os parâmetros podem ser definidos por variáveis de ambiente (valores pad
 | Variável              | Padrão                        | Descrição                                     |
 | --------------------- | ----------------------------- | --------------------------------------------- |
 | `ORTHANC_URL`         | `http://localhost:8042`       | URL do Orthanc                                |
-| `ORTHANC_USER`        | `alice`                       | Usuário do Orthanc                            |
-| `ORTHANC_PASSWORD`    | `alice`                       | Senha do Orthanc                              |
+| `ORTHANC_USER`        | `USER`                       | Usuário do Orthanc                            |
+| `ORTHANC_PASSWORD`    | `PASSWORD`                       | Senha do Orthanc                              |
 | `PDF_SOURCE_FOLDER`   | `/mnt/ecg`                    | Pasta de origem dos PDFs                      |
 | `CREATE_DATE_FOLDERS` | `true`                        | Cria subpastas por data                       |
 | `SKIP_DUP_CHECK`      | `false`                       | Ignora checagem de duplicidade                |
@@ -56,7 +56,7 @@ Todos os parâmetros podem ser definidos por variáveis de ambiente (valores pad
 | `MAX_RETRIES`         | `3`                           | Tentativas em falha de rede                   |
 | `BACKOFF_BASE_SEC`    | `1.5`                         | Fator de backoff exponencial                  |
 | `MAX_FILE_MB`         | `50`                          | Tamanho máximo permitido por PDF              |
-| `INSTITUTION_NAME`    | `HOSPITAL MUNICIPAL SAO JOSE` | Nome da instituição                           |
+| `INSTITUTION_NAME`    | `HOSPITAL DIGITAL`            | Nome da instituição                           |
 | `REFERRING_PHYSICIAN` | `AUTOMATIZADO`                | Médico responsável                            |
 
 ---
@@ -77,7 +77,7 @@ python3 PDFtoOrthanc_v2.py
 Para rodar a cada **30 minutos** e registrar logs:
 
 ```bash
-*/30 * * * * ORTHANC_URL=http://localhost:8042 ORTHANC_USER=alice ORTHANC_PASSWORD=alice PDF_SOURCE_FOLDER=/mnt/ecg /usr/bin/python3 /caminho/para/PDFtoOrthanc_v2.py >> /caminho/para/log_pdftoorthanc.log 2>&1
+*/30 * * * * ORTHANC_URL=http://localhost:8042 ORTHANC_USER=USER ORTHANC_PASSWORD=PASSWORD PDF_SOURCE_FOLDER=/mnt/ecg /usr/bin/python3 /caminho/para/PDFtoOrthanc_v2.py >> /caminho/para/log_pdftoorthanc.log 2>&1
 ```
 
 ---
