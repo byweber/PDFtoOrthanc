@@ -3,23 +3,35 @@
 """
 PDFtoOrthanc.py
 
+*************************************************************
+                HOSPITAL MUNICIPAL SAO JOSE
+             AREA DE TECNOLOGIA DA INFORMACAO
+ ------------------------------------------------------------- 
+ Criacao.......: Lucas de Souza Weber
+ Data/Criacao..: 08 de Agosto de 2025
+ Data/versao...: 07 de Setembro de 2025
+ Revisao.......: 4
+ *************************************************************
+
 Descrição geral:
 Esta ferramenta automatiza o envio de arquivos PDF (exames de ECG ou outros documentos clínicos digitalizados) para o Orthanc, convertendo-os em objetos DICOM e organizando os arquivos em pastas locais.
 
 Principais funcionalidades:
-- Leitura de arquivos PDF em uma pasta de origem (ex.: compartilhamento de rede montado).
-- Validação e parsing do nome dos arquivos, extraindo PatientID, Nome, Data e AccessionNumber.
+- Leitura de arquivos PDF em uma pasta de origem.
+- Validação de conteúdo para identificar e isolar PDFs corrompidos.
+- Parsing do nome dos arquivos via Expressão Regular configurável ou por um padrão fixo, extraindo PatientID, Nome, Data e AccessionNumber.
 - Criação de tags DICOM adequadas para envio ao Orthanc.
-- Checagem de duplicidade no Orthanc (por AccessionNumber e fallback por PatientID+StudyDate).
+- Checagem de duplicidade no Orthanc.
 - Envio dos PDFs como DICOM via API REST do Orthanc.
-- Movimentação segura dos arquivos para subpastas (Processados, Erros, Duplicatas) com organização por data.
-- Logs estruturados (console e arquivo rotativo) em formato legível e JSON.
+- Movimentação segura dos arquivos para subpastas (Processados, Erros, Duplicatas).
+- Logs estruturados (console e arquivo rotativo) em formato JSON.
 - Retentativas automáticas em falhas de rede/Orthanc com backoff exponencial.
 - Processamento paralelo configurável para melhor desempenho.
 
 Dependências:
 - Python 3.x
 - requests (pip install requests)
+- PyPDF2 (pip install PyPDF2)
 - cifs-utils (caso seja necessário montar compartilhamento SMB/CIFS no Linux)
 
 Configuração via variáveis de ambiente (com valores padrão):
@@ -27,6 +39,7 @@ Configuração via variáveis de ambiente (com valores padrão):
 - ORTHANC_USER (default: alice)
 - ORTHANC_PASSWORD (default: alice)
 - PDF_SOURCE_FOLDER (default: /mnt/ecg)
+- FILENAME_REGEX_PATTERN (Opcional, ex: '^(?P<patient_id>\d+)_(?P<name_parts>.*)_(?P<date>\d{6,8})_(?P<accession>\d+)$')
 - CREATE_DATE_FOLDERS (default: true)
 - SKIP_DUP_CHECK (default: false)
 - MAX_WORKERS (default: 2)
@@ -38,12 +51,12 @@ Configuração via variáveis de ambiente (com valores padrão):
 
 Exemplo de uso manual:
 ORTHANC_URL=http://localhost:8042 \\
-ORTHANC_USER=alice ORTHANC_PASSWORD=alice \\
 PDF_SOURCE_FOLDER=/mnt/ecg \\
-python3 PDFtoOrthanc_v2.py
+python3 PDFtoOrthanc_v4.py
 
-Exemplo de automação via crontab (executar a cada 30 minutos):
-*/30 * * * * ORTHANC_URL=http://localhost:8042 ORTHANC_USER=alice ORTHANC_PASSWORD=alice PDF_SOURCE_FOLDER=/mnt/ecg /usr/bin/python3 /caminho/para/PDFtoOrthanc_v2.py >> /caminho/para/log_pdftoorthanc.log 2>&1
+Exemplo com Regex customizado:
+FILENAME_REGEX_PATTERN='^(?P<patient_id>\d+)_(?P<name_parts>.*)_(?P<date>\d{8})_(?P<accession>\d+)$' \\
+python3 PDFtoOrthanc_v4.py
 
 ---
 """
@@ -61,12 +74,22 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Any, Tuple
 
 import requests
+try:
+    import PyPDF2
+    from PyPDF2.errors import PdfReadError
+    PYPDF2_AVAILABLE = True
+except ImportError:
+    PYPDF2_AVAILABLE = False
+
 
 # -------------------------- CONFIGURAÇÕES (via ENV) --------------------------
 ORTHANC_URL = os.getenv("ORTHANC_URL", "http://localhost:8042").rstrip("/")
 ORTHANC_USER = os.getenv("ORTHANC_USER", "alice")
 ORTHANC_PASSWORD = os.getenv("ORTHANC_PASSWORD", "alice")
 PDF_SOURCE_FOLDER = os.getenv("PDF_SOURCE_FOLDER", "/mnt/ecg")
+
+# NOVO: Permite um Regex customizado para o nome do arquivo
+FILENAME_REGEX_PATTERN = os.getenv("FILENAME_REGEX_PATTERN", None)
 
 PROCESSED_PATH = os.path.join(PDF_SOURCE_FOLDER, "Processados")
 ERROR_PATH = os.path.join(PDF_SOURCE_FOLDER, "Erros")
@@ -75,10 +98,10 @@ LOG_PATH = os.getenv("PDFFLOW_LOG", os.path.join(PDF_SOURCE_FOLDER, "pdftoorthan
 
 CREATE_DATE_FOLDERS = os.getenv("CREATE_DATE_FOLDERS", "true").lower() == "true"
 SKIP_DUP_CHECK = os.getenv("SKIP_DUP_CHECK", "false").lower() == "true"
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "2"))  # ajustar conforme capacidade do servidor
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "2"))
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
 BACKOFF_BASE_SEC = float(os.getenv("BACKOFF_BASE_SEC", "1.5"))
-MAX_FILE_MB = float(os.getenv("MAX_FILE_MB", "50"))  # preventiva, ajuste conforme Orthanc
+MAX_FILE_MB = float(os.getenv("MAX_FILE_MB", "50"))
 
 SOPCLASS_PDF = '1.2.840.10008.5.1.4.1.1.104.1'
 
@@ -95,11 +118,9 @@ logger = logging.getLogger("pdftoorthanc")
 logger.setLevel(logging.INFO)
 
 fmt = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
-# Console
 ch = logging.StreamHandler()
 ch.setFormatter(fmt)
 logger.addHandler(ch)
-# Arquivo rotativo
 os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
 fh = RotatingFileHandler(LOG_PATH, maxBytes=5 * 1024 * 1024, backupCount=5, encoding='utf-8')
 fh.setFormatter(fmt)
@@ -107,14 +128,14 @@ logger.addHandler(fh)
 
 
 def jlog(level: str, **fields):
-    """Log JSON-like (campo 'msg' opcional)."""
+    """Log JSON-like."""
     msg = json.dumps(fields, ensure_ascii=False)
     logger.log(getattr(logging, level.upper(), logging.INFO), msg)
 
 
 # -------------------------- UTIL --------------------------
-REGEX_ID = re.compile(r'^\d+$')  # Somente dígitos
-REGEX_DATE = re.compile(r'^(\d{6}|\d{8})$')  # 6 ou 8 dígitos
+REGEX_ID = re.compile(r'^\d+$')
+REGEX_DATE = re.compile(r'^(\d{6}|\d{8})$')
 
 
 def ensure_dirs():
@@ -130,11 +151,10 @@ def build_date_folder_path(base: str, study_date: str) -> str:
 
 
 def normalize_name_token(token: str) -> str:
-    # Normaliza Unicode, remove marcas combinantes (acentos), mantém letras e espaços
     token = token.strip()
     token = unicodedata.normalize('NFKD', token)
     token = ''.join(ch for ch in token if not unicodedata.combining(ch))
-    token = re.sub(r"[^A-Za-z\s]", " ", token)  # remove números e pontuação
+    token = re.sub(r"[^A-Za-z\s]", " ", token)
     token = re.sub(r"\s+", " ", token).strip()
     return token.upper()
 
@@ -144,7 +164,6 @@ def is_valid_name_part(token: str) -> bool:
 
 
 def format_dicom_date(date_str: str) -> str:
-    """Retorna YYYYMMDD. Suporta DDMMYY, DDMMYYYY, YYYYMMDD. Pivot YY >=70 => 19xx, senão 20xx."""
     if not date_str or not REGEX_DATE.match(date_str):
         return dt.datetime.now().strftime('%Y%m%d')
     try:
@@ -154,11 +173,9 @@ def format_dicom_date(date_str: str) -> str:
             d = dt.date(year, mm, dd)
         elif len(date_str) == 8:
             if date_str[:4] in ("19" + date_str[6:8], "20" + date_str[6:8]):
-                # já pode estar em YYYYMMDD
                 year, mm, dd = int(date_str[0:4]), int(date_str[4:6]), int(date_str[6:8])
                 d = dt.date(year, mm, dd)
             else:
-                # assumir DDMMYYYY
                 dd, mm, year = int(date_str[0:2]), int(date_str[2:4]), int(date_str[4:8])
                 d = dt.date(year, mm, dd)
         else:
@@ -184,180 +201,187 @@ def move_file_safe(source: str, dest_folder: str, study_date: str) -> str:
 
 # -------------------------- PARSING DE ARQUIVOS --------------------------
 
-def validate_parts(parts):
-    if len(parts) < 5:
-        return 'Formato incompleto'
-    patient_id = parts[0]
-    date_str = parts[-2]
-    acc_num = parts[-1]
-    if not REGEX_ID.match(patient_id):
-        return 'PatientID deve ser somente números'
-    if not REGEX_DATE.match(date_str):
-        return 'Data inválida'
-    if not REGEX_ID.match(acc_num):
-        return 'AccessionNumber deve ser somente números'
-    # Valida nome (tokens entre PatientID e Data)
+def validate_parts_structured(parts):
+    if len(parts) < 5: return 'Formato incompleto'
+    if not REGEX_ID.match(parts[0]): return 'PatientID deve ser somente números'
+    if not REGEX_DATE.match(parts[-2]): return 'Data inválida'
+    if not REGEX_ID.match(parts[-1]): return 'AccessionNumber deve ser somente números'
     for p in parts[1:-2]:
-        p_norm = normalize_name_token(p)
-        if not is_valid_name_part(p_norm):
+        if not is_valid_name_part(normalize_name_token(p)):
             return f"Nome inválido no campo: {p}"
     return None
 
+def _parse_with_regex(base_name: str) -> Dict[str, Any] | None:
+    """Tenta fazer o parsing usando o Regex customizado."""
+    if not FILENAME_REGEX_PATTERN:
+        return None
+    
+    match = re.match(FILENAME_REGEX_PATTERN, base_name)
+    if not match:
+        return None
+    
+    data = match.groupdict()
+    patient_id = data.get('patient_id', '')
+    accession_number = data.get('accession', '')
+    date_str = data.get('date', '')
+    name_parts_raw = data.get('name_parts', 'PACIENTE').split('_')
+    name_parts = [normalize_name_token(p) for p in name_parts_raw]
+    
+    last = name_parts[0] if len(name_parts) >= 1 else 'PACIENTE'
+    first = ' '.join(name_parts[1:]) if len(name_parts) > 1 else 'PACIENTE'
+    study_date = format_dicom_date(date_str)
+    
+    return {
+        'IsValid': True, 'Format': 'REGEX', 'PatientID': patient_id,
+        'FirstName': first, 'LastName': last, 'DateString': date_str,
+        'StudyDate': study_date, 'AccessionNumber': accession_number,
+        'HasIds': bool(patient_id and accession_number), 'Error': None
+    }
 
-def parse_filename(filename: str) -> Dict[str, Any]:
-    base = os.path.splitext(filename)[0]
-    parts_raw = base.split('_')
+def _parse_fallback(base_name: str) -> Dict[str, Any]:
+    """Lógica original de parsing (estruturado e legado)."""
+    parts_raw = base_name.split('_')
     parts = [p.strip() for p in parts_raw if p.strip()]
-    err = validate_parts(parts)
+    
+    # Tentativa 1: Formato estruturado
+    err = validate_parts_structured(parts)
     if not err:
-        patient_id = parts[0]
-        date_str = parts[-2]
-        accession_number = parts[-1]
-        name_parts_raw = parts[1:-2]
-        name_parts = [normalize_name_token(p) for p in name_parts_raw]
-        # montar patient name com last name = primeiro token, first name = resto
+        name_parts = [normalize_name_token(p) for p in parts[1:-2]]
         last = name_parts[0] if len(name_parts) >= 1 else 'PACIENTE'
         first = ' '.join(name_parts[1:]) if len(name_parts) > 1 else 'PACIENTE'
-        study_date = format_dicom_date(date_str)
         return {
-            'IsValid': True,
-            'Format': 'ESTRUTURADO',
-            'PatientID': patient_id,
-            'FirstName': first,
-            'LastName': last,
-            'DateString': date_str,
-            'StudyDate': study_date,
-            'AccessionNumber': accession_number,
-            'HasIds': True,
-            'Error': None
+            'IsValid': True, 'Format': 'ESTRUTURADO', 'PatientID': parts[0],
+            'FirstName': first, 'LastName': last, 'DateString': parts[-2],
+            'StudyDate': format_dicom_date(parts[-2]), 'AccessionNumber': parts[-1],
+            'HasIds': True, 'Error': None
         }
-    # LEGADO: procurar último token de data válido
+
+    # Tentativa 2: Formato legado
     date_index = -1
     for i in range(len(parts) - 1, -1, -1):
         if REGEX_DATE.match(parts[i]):
             try:
-                _ = format_dicom_date(parts[i])
-                date_index = i
-                break
-            except Exception:
-                continue
+                _ = format_dicom_date(parts[i]); date_index = i; break
+            except Exception: continue
+    
     if date_index > 0:
         name_tokens = [normalize_name_token(p) for p in parts[:date_index]]
-        # first token vira FirstName para manter compatibilidade com v1
         first = name_tokens[0] if name_tokens else 'PACIENTE'
         last = ' '.join(name_tokens[1:]) if len(name_tokens) > 1 else 'PACIENTE'
-        study_date = format_dicom_date(parts[date_index])
         return {
-            'IsValid': True,
-            'Format': 'LEGADO',
-            'PatientID': '',
-            'FirstName': first,
-            'LastName': last,
-            'DateString': parts[date_index],
-            'StudyDate': study_date,
-            'AccessionNumber': '',
-            'HasIds': False,
-            'Error': None
+            'IsValid': True, 'Format': 'LEGADO', 'PatientID': '', 'FirstName': first,
+            'LastName': last, 'DateString': parts[date_index],
+            'StudyDate': format_dicom_date(parts[date_index]), 'AccessionNumber': '',
+            'HasIds': False, 'Error': None
         }
+
     return {
-        'IsValid': False,
-        'Format': 'INVALIDO',
-        'PatientID': '',
-        'FirstName': 'ERRO',
-        'LastName': 'FORMATO',
-        'DateString': '',
-        'StudyDate': dt.datetime.now().strftime('%Y%m%d'),
-        'AccessionNumber': '',
-        'HasIds': False,
-        'Error': 'Formato inválido'
+        'IsValid': False, 'Format': 'INVALIDO', 'PatientID': '', 'FirstName': 'ERRO',
+        'LastName': 'FORMATO', 'DateString': '', 'StudyDate': dt.datetime.now().strftime('%Y%m%d'),
+        'AccessionNumber': '', 'HasIds': False, 'Error': 'Formato de nome de arquivo inválido'
     }
 
+def parse_filename(filename: str) -> Dict[str, Any]:
+    base = os.path.splitext(filename)[0]
+    parsed_data = _parse_with_regex(base)
+    if parsed_data:
+        return parsed_data
+    return _parse_fallback(base)
 
 # -------------------------- ORTHANC --------------------------
 
 def get_auth_header(user: str, password: str) -> Dict[str, str]:
-    headers = {}
     if user and password:
-        auth = f"{user}:{password}"
-        b64auth = base64.b64encode(auth.encode()).decode()
-        headers['Authorization'] = f"Basic {b64auth}"
-    return headers
+        auth = base64.b64encode(f"{user}:{password}".encode()).decode()
+        return {'Authorization': f"Basic {auth}"}
+    return {}
 
-
-def req_with_retry(method: str, url: str, session: requests.Session, headers: Dict[str, str],
-                   json_body: Dict[str, Any] | None = None, timeout: float = 60.0) -> requests.Response:
+def req_with_retry(method: str, url: str, session: requests.Session, **kwargs) -> requests.Response:
     last_exc = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            r = session.request(method=method, url=url, headers=headers, json=json_body, timeout=timeout)
+            r = session.request(method=method, url=url, **kwargs)
             r.raise_for_status()
             return r
         except Exception as e:
             last_exc = e
             wait = BACKOFF_BASE_SEC ** attempt
             jlog("warning", event="http_retry", attempt=attempt, wait_s=round(wait, 2), url=url, error=str(e))
-            try:
-                import time
-                time.sleep(wait)
-            except Exception:
-                pass
-    raise last_exc  # esgota as tentativas
-
+            import time; time.sleep(wait)
+    raise last_exc
 
 def test_orthanc_connection(url: str, headers: Dict[str, str]) -> Tuple[bool, str]:
     with requests.Session() as s:
         try:
-            r = req_with_retry("GET", f"{url}/system", s, headers, timeout=10)
-            version = r.json().get('Version', '')
-            return True, version
+            r = req_with_retry("GET", f"{url}/system", s, headers=headers, timeout=10)
+            return True, r.json().get('Version', '')
         except Exception as e:
             return False, str(e)
 
-
-def find_duplicate(accession: str | None, patient_id: str | None, study_date: str, url: str, headers: Dict[str, str]) -> Tuple[bool, str | None]:
+def find_duplicate(accession: str, patient_id: str, study_date: str, url: str, headers: Dict[str, str]) -> Tuple[bool, str | None]:
     with requests.Session() as s:
-        # 1) Por AccessionNumber
         if accession:
             try:
-                body = {"Level": "Study", "Query": {"AccessionNumber": accession}, "Expand": True}
-                r = req_with_retry("POST", f"{url}/tools/find", s, {**headers, 'Content-Type': 'application/json'}, body, timeout=30)
-                data = r.json()
-                if data:
-                    return True, data[0].get("ID")
+                body = {"Level": "Study", "Query": {"AccessionNumber": accession}}
+                r = req_with_retry("POST", f"{url}/tools/find", s, headers=headers, json=body, timeout=30)
+                if r.json(): return True, r.json()[0].get("ID")
             except Exception as e:
                 jlog("warning", event="find_accession_failed", accession=accession, error=str(e))
-        # 2) Fallback por PatientID + StudyDate
         if patient_id:
             try:
-                body = {"Level": "Study", "Query": {"PatientID": patient_id, "StudyDate": study_date}, "Expand": True}
-                r = req_with_retry("POST", f"{url}/tools/find", s, {**headers, 'Content-Type': 'application/json'}, body, timeout=30)
-                data = r.json()
-                if data:
-                    return True, data[0].get("ID")
+                body = {"Level": "Study", "Query": {"PatientID": patient_id, "StudyDate": study_date}}
+                r = req_with_retry("POST", f"{url}/tools/find", s, headers=headers, json=body, timeout=30)
+                if r.json(): return True, r.json()[0].get("ID")
             except Exception as e:
                 jlog("warning", event="find_patient_date_failed", patient_id=patient_id, study_date=study_date, error=str(e))
     return False, None
 
-
 def send_pdf_as_dicom(pdf_path: str, url: str, headers: Dict[str, str], tags: Dict[str, Any]) -> Dict[str, Any]:
     size_mb = round(os.path.getsize(pdf_path) / (1024 * 1024), 2)
     if size_mb > MAX_FILE_MB:
-        raise RuntimeError(f"PDF acima do limite permitido: {size_mb} MB > {MAX_FILE_MB} MB")
+        raise RuntimeError(f"PDF > {MAX_FILE_MB}MB: {size_mb}MB")
     with open(pdf_path, 'rb') as f:
-        pdf_bytes = f.read()
-    pdf_b64 = base64.b64encode(pdf_bytes).decode()
+        pdf_b64 = base64.b64encode(f.read()).decode()
     payload = {"Tags": tags, "Content": f"data:application/pdf;base64,{pdf_b64}"}
-    timeout = max(60.0, 15.0 + size_mb * 1.5)  # timeout proporcional ao tamanho
+    timeout = max(60.0, 15.0 + size_mb * 1.5)
     with requests.Session() as s:
-        r = req_with_retry("POST", f"{url}/tools/create-dicom", s, {**headers, 'Content-Type': 'application/json'}, payload, timeout=timeout)
+        r = req_with_retry("POST", f"{url}/tools/create-dicom", s, headers=headers, json=payload, timeout=timeout)
         return r.json()
 
-
 # -------------------------- PROCESSAMENTO --------------------------
+
+def build_dicom_tags(parsed_data: Dict[str, Any]) -> Dict[str, str]:
+    """Cria o dicionário de tags DICOM a partir dos dados parseados."""
+    hhmmss = dt.datetime.now().strftime('%H%M%S')
+    tags = {
+        "PatientName": f"{parsed_data['LastName']}^{parsed_data['FirstName']}",
+        "StudyDescription": FIXED_EXAM['Type'],
+        "StudyDate": parsed_data['StudyDate'], "StudyTime": hhmmss,
+        "SeriesDescription": f"{FIXED_EXAM['Type']} - PDF",
+        "SeriesDate": parsed_data['StudyDate'], "SeriesTime": hhmmss,
+        "SeriesNumber": "1", "Modality": FIXED_EXAM['Modality'],
+        "ContentDate": parsed_data['StudyDate'], "ContentTime": hhmmss,
+        "InstanceNumber": "1", "InstitutionName": INSTITUTION_NAME,
+        "ReferringPhysicianName": REFERRING_PHYSICIAN, "SOPClassUID": SOPCLASS_PDF
+    }
+    if parsed_data.get('PatientID'): tags['PatientID'] = parsed_data['PatientID']
+    if parsed_data.get('AccessionNumber'): tags['AccessionNumber'] = parsed_data['AccessionNumber']
+    return tags
 
 def process_file(full_path: str, orthanc_url: str, headers: Dict[str, str]) -> Dict[str, Any]:
     name = os.path.basename(full_path)
     jlog("info", event="processing_start", file=name)
+
+    # MELHORIA: Validar se o PDF não está corrompido
+    if PYPDF2_AVAILABLE:
+        try:
+            with open(full_path, 'rb') as f:
+                PyPDF2.PdfReader(f)
+        except (PdfReadError, Exception) as e:
+            jlog("error", event="corrupted_pdf", file=name, error=str(e))
+            moved_to = move_file_safe(full_path, ERROR_PATH, '')
+            return {'Success': False, 'Reason': 'PDF corrompido ou ilegível', 'MovedTo': moved_to}
+
     parsed = parse_filename(name)
     if not parsed['IsValid']:
         jlog("warning", event="invalid_format", file=name, reason=parsed['Error'])
@@ -365,36 +389,16 @@ def process_file(full_path: str, orthanc_url: str, headers: Dict[str, str]) -> D
         return {'Success': False, 'Skipped': True, 'Reason': 'Formato de arquivo inválido', 'File': name, 'MovedTo': moved}
 
     if not SKIP_DUP_CHECK:
-        exists, study_id = find_duplicate(parsed.get('AccessionNumber') or None, parsed.get('PatientID') or None, parsed['StudyDate'], orthanc_url, headers)
+        acc = parsed.get('AccessionNumber')
+        pid = parsed.get('PatientID')
+        sdate = parsed['StudyDate']
+        exists, study_id = find_duplicate(acc, pid, sdate, orthanc_url, headers)
         if exists:
-            jlog("info", event="duplicate_detected", file=name, accession=parsed.get('AccessionNumber'), study_id=study_id)
+            jlog("info", event="duplicate_detected", file=name, accession=acc, study_id=study_id)
             moved = move_file_safe(full_path, DUPLICATE_PATH, parsed['StudyDate'])
-            return {'Success': False, 'Skipped': True, 'Duplicate': True, 'AccessionNumber': parsed.get('AccessionNumber', ''), 'File': name, 'Reason': 'Estudo já existe', 'MovedTo': moved}
+            return {'Success': False, 'Skipped': True, 'Duplicate': True, 'AccessionNumber': acc, 'File': name, 'Reason': 'Estudo já existe', 'MovedTo': moved}
 
-    hhmmss = dt.datetime.now().strftime('%H%M%S')
-    tags = {
-        "PatientName": f"{parsed['LastName']}^{parsed['FirstName']}",
-        "StudyDescription": FIXED_EXAM['Type'],
-        "StudyDate": parsed['StudyDate'],
-        "StudyTime": hhmmss,
-        "SeriesDescription": f"{FIXED_EXAM['Type']} - PDF",
-        "SeriesDate": parsed['StudyDate'],
-        "SeriesTime": hhmmss,
-        "SeriesNumber": "1",
-        "Modality": FIXED_EXAM['Modality'],
-        "ContentDate": parsed['StudyDate'],
-        "ContentTime": hhmmss,
-        "InstanceNumber": "1",
-        "InstitutionName": INSTITUTION_NAME,
-        "ReferringPhysicianName": REFERRING_PHYSICIAN,
-        "SOPClassUID": SOPCLASS_PDF
-    }
-    if parsed['PatientID']:
-        tags['PatientID'] = parsed['PatientID']
-    if parsed['AccessionNumber']:
-        tags['AccessionNumber'] = parsed['AccessionNumber']
-
-    # Enviar com retentativas internas (req_with_retry)
+    tags = build_dicom_tags(parsed)
     try:
         resp = send_pdf_as_dicom(full_path, orthanc_url, headers, tags)
         size_mb = round(os.path.getsize(full_path) / (1024 * 1024), 2)
@@ -406,11 +410,11 @@ def process_file(full_path: str, orthanc_url: str, headers: Dict[str, str]) -> D
         moved = move_file_safe(full_path, ERROR_PATH, '')
         return {'Success': False, 'Error': str(e), 'File': name, 'MovedTo': moved}
 
-
 # -------------------------- MAIN --------------------------
-
 def main():
-    logger.info("=== PDF para Orthanc v2 (Python) ===")
+    logger.info("=== PDF para Orthanc v4 (Python) ===")
+    if not PYPDF2_AVAILABLE:
+        logger.warning("Biblioteca PyPDF2 não encontrada. A validação de PDFs corrompidos será pulada. Instale com: pip install PyPDF2")
 
     folder = PDF_SOURCE_FOLDER
     if not os.path.isdir(folder):
@@ -418,7 +422,6 @@ def main():
         return
 
     ensure_dirs()
-
     headers = get_auth_header(ORTHANC_USER, ORTHANC_PASSWORD)
     connected, info = test_orthanc_connection(ORTHANC_URL, headers)
     if not connected:
@@ -427,46 +430,40 @@ def main():
     logger.info(f"Conectado ao Orthanc, versão: {info}")
 
     files = [f for f in os.listdir(folder) if f.lower().endswith('.pdf')]
-    if len(files) == 0:
-        logger.warning("Nenhum arquivo PDF encontrado na pasta.")
+    if not files:
+        logger.info("Nenhum arquivo PDF encontrado na pasta.")
         return
 
     logger.info(f"Arquivos encontrados: {len(files)} | workers={MAX_WORKERS}")
 
-    total_ok = 0
-    total_dup = 0
-    total_err = 0
-
+    summary = {"processados": 0, "duplicatas": 0, "erros": 0}
     file_paths = [os.path.join(folder, f) for f in files]
 
-    if MAX_WORKERS > 1:
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+    executor = ThreadPoolExecutor(max_workers=MAX_WORKERS) if MAX_WORKERS > 1 else None
+    
+    def process_and_update_summary(result):
+        if result.get('Success'):
+            summary['processados'] += 1
+        elif result.get('Duplicate'):
+            summary['duplicatas'] += 1
+        else:
+            summary['erros'] += 1
+
+    if executor:
+        with executor as ex:
             futures = {ex.submit(process_file, p, ORTHANC_URL, headers): p for p in file_paths}
             for fut in as_completed(futures):
-                res = fut.result()
-                if res.get('Success'):
-                    total_ok += 1
-                elif res.get('Duplicate'):
-                    total_dup += 1
-                else:
-                    total_err += 1
-    else:
+                process_and_update_summary(fut.result())
+    else: # Processamento sequencial
         for p in file_paths:
             res = process_file(p, ORTHANC_URL, headers)
-            if res.get('Success'):
-                total_ok += 1
-            elif res.get('Duplicate'):
-                total_dup += 1
-            else:
-                total_err += 1
+            process_and_update_summary(res)
 
-    summary = {"processados": total_ok, "duplicatas": total_dup, "erros": total_err}
     jlog("info", event="summary", **summary)
-    print("Resumo do processamento:")
-    print(f"  Processados com sucesso: {total_ok}")
-    print(f"  Duplicatas puladas: {total_dup}")
-    print(f"  Erros: {total_err}")
-
+    print("\nResumo do processamento:")
+    print(f"  - Processados com sucesso: {summary['processados']}")
+    print(f"  - Duplicatas puladas:      {summary['duplicatas']}")
+    print(f"  - Erros:                   {summary['erros']}")
 
 if __name__ == "__main__":
     main()
