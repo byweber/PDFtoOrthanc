@@ -231,7 +231,6 @@ Este projeto está licenciado sob a Licença MIT - veja o arquivo [LICENSE](LICE
 
 - [ ] Interface web para monitoramento
 - [ ] Suporte a outros formatos de arquivo
-- [ ] Integração com HL7 FHIR
 - [ ] Dashboard de métricas
 - [ ] Notificações automáticas
 - [ ] Processamento em lote com agenda
