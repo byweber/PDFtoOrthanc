@@ -120,22 +120,6 @@ export MAX_WORKERS=4
 python PDFtoOrthanc.py
 ```
 
-### Execução com Docker (exemplo)
-
-```dockerfile
-FROM python:3.11-slim
-
-WORKDIR /app
-COPY PDFtoOrthanc.py requirements.txt ./
-RUN pip install -r requirements.txt
-
-ENV ORTHANC_URL=http://orthanc:8042
-ENV PDF_SOURCE_FOLDER=/data/pdfs
-
-VOLUME ["/data"]
-CMD ["python", "PDFtoOrthanc.py"]
-```
-
 ## 🔍 Verificação de Duplicatas
 
 O script verifica duplicatas usando quatro métodos diferentes:
