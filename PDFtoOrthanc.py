@@ -37,7 +37,7 @@ FIXED_EXAM = {
     "Modality": os.getenv("EXAM_MODALITY", "ECG")
 }
 
-INSTITUTION_NAME = os.getenv("INSTITUTION_NAME", "HOSPITAL MUNICIPAL SAO JOSE")
+INSTITUTION_NAME = os.getenv("INSTITUTION_NAME", "HOSPITAL DIGITAL")
 REFERRING_PHYSICIAN = os.getenv("REFERRING_PHYSICIAN", "AUTOMATIZADO")
 
 # -------------------------- LOGGING --------------------------
