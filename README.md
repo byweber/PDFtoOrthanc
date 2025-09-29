@@ -225,7 +225,7 @@ MAX_FILE_MB=50
 
 ## 📄 Licença
 
-Este projeto está licenciado sob a Licença MIT - veja o arquivo [LICENSE](LICENSE) para detalhes.
+Este projeto é licenciado sob a GNU General Public License v3.0 (GPLv3) - veja o arquivo [LICENSE](LICENSE) para detalhes.
 
 ## 🚀 Roadmap
 
